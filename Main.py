@@ -43,28 +43,25 @@ def get_current_price(coin_id, vs_currency='usd'):
         return None
 
 # -------------------------------
-# Fonctions de simulation & forecast
+# Fonction de simulation & forecast pour la partie crypto
 # -------------------------------
 
-def forecast_price_series(price_series, forecast_days=365, n_simulations=500):
-    log_returns = np.log(price_series / price_series.shift(1)).dropna()
-    mu = log_returns.mean()
-    sigma = log_returns.std()
-    last_price = price_series.iloc[-1]
-    dt = 1  # daily step
-
-    sims = np.zeros((n_simulations, forecast_days+1))
-    sims[:, 0] = last_price
-
+def simulate_crypto_forecast(crypto_agg_hist, forecast_days=365, n_simulations=500):
+    # Calculer les rendements journaliers (log)
+    daily_returns = np.log(crypto_agg_hist / crypto_agg_hist.shift(1)).dropna()
+    mu_crypto = daily_returns.mean()
+    sigma_crypto = daily_returns.std()
+    last_value = crypto_agg_hist.iloc[-1]
+    
+    # Simulation GBM
+    sims = np.zeros((forecast_days+1, n_simulations))
+    sims[0, :] = last_value
     for t in range(1, forecast_days+1):
-        shocks = np.random.normal(mu * dt, sigma * np.sqrt(dt), n_simulations)
-        sims[:, t] = sims[:, t-1] * np.exp(shocks)
-
-    sim_df = pd.DataFrame(sims.T)
-    sim_df.index = [price_series.index[-1] + timedelta(days=i) for i in range(forecast_days+1)]
-    quantiles = sim_df.quantile([0.05, 0.50, 0.95]).T
-    quantiles.columns = ['q05', 'q50', 'q95']
-    return sim_df, quantiles
+        shocks = np.random.normal(mu_crypto, sigma_crypto, n_simulations)
+        sims[t, :] = sims[t-1, :] * np.exp(shocks)
+    sim_df = pd.DataFrame(sims, 
+                          index=[crypto_agg_hist.index[-1] + timedelta(days=i) for i in range(forecast_days+1)])
+    return sim_df
 
 # -------------------------------
 # Fonctions d'analyse de risque
@@ -171,15 +168,30 @@ if not price_data:
     st.error("Aucune donnée historique récupérée pour les cryptos sélectionnées.")
     st.stop()
 
-# Calcul des valeurs actuelles
+# Calcul des valeurs actuelles pour chaque crypto (hypothèse d'achat au prix initial)
 crypto_values = {}
 for coin_name, alloc_pct in allocation_inputs.items():
     coin_id = coin_dict[coin_name]
     alloc_amount = total_portfolio * (alloc_pct / 100)
-    crypto_values[coin_name] = alloc_amount  # Supposé acquis au prix actuel
+    crypto_values[coin_name] = alloc_amount
 
 cash_value = total_portfolio * (cash_allocation/100)
 portfolio_current = sum(crypto_values.values()) + cash_value
+
+# -------------------------------
+# Construction de l'historique agrégé de la partie crypto
+# -------------------------------
+crypto_agg_hist = None
+for coin_name, alloc_pct in allocation_inputs.items():
+    coin_id = coin_dict[coin_name]
+    allocation_amount = total_portfolio * (alloc_pct / 100)
+    series = price_data[coin_id]['price']
+    # Valeur de l'investissement dans la crypto, supposé acheté au début de la période
+    value_series = series * (allocation_amount / series.iloc[0])
+    if crypto_agg_hist is None:
+        crypto_agg_hist = value_series
+    else:
+        crypto_agg_hist = crypto_agg_hist.add(value_series, fill_value=0)
 
 # -------------------------------
 # Création des onglets
@@ -248,34 +260,28 @@ with tab2:
     global_return = (portfolio_current/total_portfolio - 1)*100
     st.write(f"**Rendement Global :** {global_return:.2f}%")
     
-    # --- Forecast Global avec Enveloppe ---
+    # --- Forecast Global avec Enveloppe via simulation GBM sur la partie crypto ---
     st.markdown("#### Projection Globale du Portefeuille sur 12 mois (Enveloppe)")
+    
     n_simulations = 500
-    # Initialiser une matrice pour les simulations agrégées (shape: (forecast_days+1, n_simulations))
-    agg_sim = np.zeros((forecast_days+1, n_simulations))
-    # Pour chaque crypto, ajouter sa simulation pondérée
-    for coin_name, alloc_pct in allocation_inputs.items():
-        coin_id = coin_dict[coin_name]
-        series = price_data[coin_id]['price']
-        sim_df, _ = forecast_price_series(series, forecast_days=forecast_days, n_simulations=n_simulations)
-        allocation_amount = total_portfolio * (alloc_pct / 100)
-        # Nombre de coins acquis au prix actuel
-        num_coins = allocation_amount / current_prices[coin_id]
-        agg_sim += sim_df.values * num_coins
-
-    # Simulation du cash (déterministe)
+    # Simulation pour la partie crypto via GBM
+    simulated_crypto_df = simulate_crypto_forecast(crypto_agg_hist, forecast_days=forecast_days, n_simulations=n_simulations)
+    
+    # Simulation du cash (déterministe, avec croissance exponentielle)
     days_array = np.arange(forecast_days+1)
-    cash_sim = cash_value * (1 + (yield_cash/100) * (days_array/365))
-    # Ajouter le cash à toutes les simulations
-    agg_sim += cash_sim[:, np.newaxis]
+    cash_forecast = cash_value * np.exp((yield_cash/100) * (days_array/365))
     
-    # Définir les dates forecast
-    last_date = list(price_data.values())[0].index[-1]
+    # Agréger la partie crypto simulée et le cash
+    # Pour chaque simulation, ajouter le cash forecast (broadcasting)
+    portfolio_sim = simulated_crypto_df.values + cash_forecast[:, np.newaxis]
+    
+    # Conversion en DataFrame avec dates forecast
+    last_date = crypto_agg_hist.index[-1]
     forecast_dates = [last_date + timedelta(days=i) for i in range(forecast_days+1)]
+    portfolio_sim_df = pd.DataFrame(portfolio_sim, index=forecast_dates)
     
-    # Convertir en DataFrame et calculer les quantiles le long de l'axe des simulations (axis=1)
-    agg_sim_df = pd.DataFrame(agg_sim, index=forecast_dates)
-    agg_quantiles = agg_sim_df.quantile([0.05, 0.50, 0.95], axis=1)
+    # Calcul des quantiles (enveloppe) le long des simulations (axis=1)
+    agg_quantiles = portfolio_sim_df.quantile([0.05, 0.50, 0.95], axis=1)
     agg_quantiles.columns = ['q05', 'q50', 'q95']
     
     # Graphique de l'enveloppe forecast
@@ -293,10 +299,10 @@ with tab2:
     
     # --- Visualisation des Fees Prévisionnels ---
     st.markdown("#### Projection des Fees Prévisionnels sur 12 mois")
-    # Management Fee : fee quotidien = (management_fee/365) * valeur forecastée (médiane)
+    # Pour la gestion, le fee quotidien = (management_fee/365) * valeur forecastée médiane
     daily_mgmt_fee = agg_quantiles['q50'] * (management_fee / 365)
     cumulative_mgmt_fee = np.cumsum(daily_mgmt_fee)
-    # Performance Fee : appliqué sur le gain par rapport à la valeur actuelle (si positif), réparti linéairement
+    # Pour la performance, fee appliqué sur le gain par rapport à la valeur actuelle (si positif), réparti linéairement
     daily_perf_fee = np.maximum(agg_quantiles['q50'] - portfolio_current, 0) * (performance_fee / forecast_days)
     cumulative_perf_fee = np.cumsum(daily_perf_fee)
     cumulative_total_fee = cumulative_mgmt_fee + cumulative_perf_fee
