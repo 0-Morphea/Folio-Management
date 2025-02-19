@@ -251,8 +251,8 @@ with tab2:
     # --- Forecast Global avec Enveloppe ---
     st.markdown("#### Projection Globale du Portefeuille sur 12 mois (Enveloppe)")
     n_simulations = 500
-    # Initialiser un tableau pour les simulations agrégées
-    agg_sim = np.zeros((n_simulations, forecast_days+1))
+    # Initialiser une matrice pour les simulations agrégées (shape: (forecast_days+1, n_simulations))
+    agg_sim = np.zeros((forecast_days+1, n_simulations))
     # Pour chaque crypto, ajouter sa simulation pondérée
     for coin_name, alloc_pct in allocation_inputs.items():
         coin_id = coin_dict[coin_name]
@@ -261,22 +261,24 @@ with tab2:
         allocation_amount = total_portfolio * (alloc_pct / 100)
         # Nombre de coins acquis au prix actuel
         num_coins = allocation_amount / current_prices[coin_id]
-        # Ajouter la valeur forecastée pour cette crypto
         agg_sim += sim_df.values * num_coins
+
     # Simulation du cash (déterministe)
     days_array = np.arange(forecast_days+1)
     cash_sim = cash_value * (1 + (yield_cash/100) * (days_array/365))
-    # Ajouter le cash (même pour toutes les simulations)
-    agg_sim += np.tile(cash_sim, (n_simulations, 1))
+    # Ajouter le cash à toutes les simulations
+    agg_sim += cash_sim[:, np.newaxis]
     
-    # Conversion en DataFrame
-    forecast_dates = [list(price_data.values())[0].index[-1] + timedelta(days=i) for i in range(forecast_days+1)]
-    agg_sim_df = pd.DataFrame(agg_sim.T, index=forecast_dates)
-    # Calcul des quantiles pour l'enveloppe
-    agg_quantiles = agg_sim_df.quantile([0.05, 0.50, 0.95]).T
+    # Définir les dates forecast
+    last_date = list(price_data.values())[0].index[-1]
+    forecast_dates = [last_date + timedelta(days=i) for i in range(forecast_days+1)]
+    
+    # Convertir en DataFrame et calculer les quantiles le long de l'axe des simulations (axis=1)
+    agg_sim_df = pd.DataFrame(agg_sim, index=forecast_dates)
+    agg_quantiles = agg_sim_df.quantile([0.05, 0.50, 0.95], axis=1)
     agg_quantiles.columns = ['q05', 'q50', 'q95']
     
-    # Graphique de l'enveloppe
+    # Graphique de l'enveloppe forecast
     fig_envelope = go.Figure()
     fig_envelope.add_trace(go.Scatter(x=agg_quantiles.index, y=agg_quantiles['q05'], mode='lines',
                                       line=dict(color='red', dash='dash'), name='5e percentile'))
@@ -289,16 +291,16 @@ with tab2:
                                yaxis_type="log" if log_scale else "linear")
     st.plotly_chart(fig_envelope, use_container_width=True)
     
-    # --- Visualisation des Fees prévisionnels ---
+    # --- Visualisation des Fees Prévisionnels ---
     st.markdown("#### Projection des Fees Prévisionnels sur 12 mois")
-    # Pour le management fee : fee quotidien = (management_fee/365) * valeur forecastée
+    # Management Fee : fee quotidien = (management_fee/365) * valeur forecastée (médiane)
     daily_mgmt_fee = agg_quantiles['q50'] * (management_fee / 365)
     cumulative_mgmt_fee = np.cumsum(daily_mgmt_fee)
-    # Pour le performance fee : appliqué sur le gain par rapport à la valeur actuelle (si positif)
+    # Performance Fee : appliqué sur le gain par rapport à la valeur actuelle (si positif), réparti linéairement
     daily_perf_fee = np.maximum(agg_quantiles['q50'] - portfolio_current, 0) * (performance_fee / forecast_days)
     cumulative_perf_fee = np.cumsum(daily_perf_fee)
     cumulative_total_fee = cumulative_mgmt_fee + cumulative_perf_fee
-    
+
     fig_fees = go.Figure()
     fig_fees.add_trace(go.Scatter(x=agg_quantiles.index, y=cumulative_mgmt_fee, mode='lines',
                                   name='Cumulative Management Fee'))
