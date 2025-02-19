@@ -80,7 +80,7 @@ def risk_metrics(price_series):
     return volatility, max_drawdown
 
 def risk_label(volatility, max_drawdown):
-    # Exemple de seuils (à ajuster selon votre modèle) :
+    # Exemple de seuils (à ajuster selon votre modèle)
     if volatility < 0.5 and max_drawdown > -0.15:
         return "Low Risk"
     elif volatility < 1.0 and max_drawdown > -0.30:
@@ -103,6 +103,9 @@ def portfolio_allocation_pie(allocation_dict, cash_value):
 # -------------------------------
 
 st.sidebar.header("Configuration du Portfolio")
+
+# Option pour échelle logarithmique
+log_scale = st.sidebar.checkbox("Utiliser une échelle logarithmique pour les graphiques", value=False)
 
 # 1. Sélection parmi le Top 200
 top_coins_df = get_top_coins(n=200)
@@ -193,6 +196,8 @@ with tab1:
     for coin_id, df in price_data.items():
         coin_name = top_coins_df[top_coins_df['id'] == coin_id]['name'].values[0]
         fig_hist.add_trace(go.Scatter(x=df.index, y=df['price'], mode='lines', name=coin_name))
+    if log_scale:
+        fig_hist.update_layout(yaxis_type="log")
     st.plotly_chart(fig_hist, use_container_width=True)
     
     # Projection pour chaque crypto
@@ -206,7 +211,8 @@ with tab1:
         fig_proj.add_trace(go.Scatter(x=quantiles.index, y=quantiles['q95'], mode='lines', line=dict(color='green', dash='dash'), name='95e percentile', fill='tonexty'))
         fig_proj.add_trace(go.Scatter(x=quantiles.index, y=quantiles['q50'], mode='lines', line=dict(color='blue'), name='Médiane'))
         fig_proj.update_layout(title=f"Projection de Prix pour {coin_name}",
-                               xaxis_title="Date", yaxis_title="Prix ($)")
+                               xaxis_title="Date", yaxis_title="Prix ($)",
+                               yaxis_type="log" if log_scale else "linear")
         st.plotly_chart(fig_proj, use_container_width=True)
     
     # Analyses complémentaires individuelles
@@ -243,42 +249,35 @@ with tab2:
     
     # Agrégation Forecast Globale
     st.markdown("#### Forecast Global sur 12 mois")
-    # Pour chaque crypto, on projette la médiane et on la pondère selon l'allocation
     forecast_agg = pd.Series(index=[list(price_data.values())[0].index[-1] + timedelta(days=i) for i in range(forecast_days+1)], dtype=float)
     forecast_agg[:] = 0.0
     for coin_name, alloc_pct in allocation_inputs.items():
         coin_id = coin_dict[coin_name]
         series = price_data[coin_id]['price']
         _, quantiles = forecast_price_series(series, forecast_days=forecast_days, n_simulations=500)
-        # Valeur forecastée = allocation initiale * (quantile médian / prix actuel)
         allocation_amount = total_portfolio * (alloc_pct / 100)
         forecast_agg += quantiles['q50'] * (allocation_amount / current_prices[coin_id])
-    # Projection du cash (yield simple)
     cash_forecast = cash_value * (1 + (yield_cash/100) * (np.arange(forecast_days+1)/365))
     global_forecast = forecast_agg + pd.Series(cash_forecast, index=forecast_agg.index)
     
-    # Visualisation de l'évolution globale
     fig_global = go.Figure()
     fig_global.add_trace(go.Scatter(x=global_forecast.index, y=global_forecast, mode='lines', name='Forecast Global (Médiane)'))
     fig_global.update_layout(title="Projection Globale du Portefeuille sur 12 mois",
-                             xaxis_title="Date", yaxis_title="Valeur du Portefeuille ($)")
+                             xaxis_title="Date", yaxis_title="Valeur du Portefeuille ($)",
+                             yaxis_type="log" if log_scale else "linear")
     st.plotly_chart(fig_global, use_container_width=True)
     
     # Analyses de risque global
-    # Pour simplifier, on peut estimer la volatilité et le max drawdown à partir de l'évolution historique agrégée
-    # Agrégation historique
     portfolio_hist = pd.Series(dtype=float)
     for coin_name, alloc_pct in allocation_inputs.items():
         coin_id = coin_dict[coin_name]
         allocation_amount = total_portfolio * (alloc_pct / 100)
         series = price_data[coin_id]['price']
-        # Convertir les prix en valeur en fonction de l'allocation (en supposant achat au prix initial)
         val_series = series * (allocation_amount / series.iloc[0])
         if portfolio_hist.empty:
             portfolio_hist = val_series
         else:
             portfolio_hist = portfolio_hist.add(val_series, fill_value=0)
-    # Ajouter le cash historique (supposé constant à l'investissement initial pour simplifier)
     portfolio_hist += cash_value
 
     vol_global, md_global = risk_metrics(portfolio_hist)
@@ -288,9 +287,9 @@ with tab2:
     risk_lvl = risk_label(vol_global, md_global)
     st.write(f"**Niveau de Risque Global :** {risk_lvl}")
     
-    # Autres représentations pertinentes
     st.markdown("#### Évolution Historique du Portefeuille")
     fig_hist_global = go.Figure()
     fig_hist_global.add_trace(go.Scatter(x=portfolio_hist.index, y=portfolio_hist, mode='lines', name='Historique Agrégé'))
-    fig_hist_global.update_layout(xaxis_title="Date", yaxis_title="Valeur ($)")
+    fig_hist_global.update_layout(xaxis_title="Date", yaxis_title="Valeur ($)",
+                                  yaxis_type="log" if log_scale else "linear")
     st.plotly_chart(fig_hist_global, use_container_width=True)
