@@ -3,130 +3,153 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-import cvxpy as cp
 from datetime import datetime, timedelta
 from pycoingecko import CoinGeckoAPI
 
-# --- Récupération des données via CoinGecko ---
+# -------------------------------
+# Fonctions d'accès aux données
+# -------------------------------
+
 @st.cache_data(ttl=3600)
-def fetch_crypto_data(crypto_list, days=365, vs_currency='usd'):
+def get_top_coins(n=200, vs_currency='usd'):
+    """
+    Récupère les top n cryptos par capitalisation via CoinGecko.
+    Retourne une DataFrame avec les colonnes: id, symbol, name.
+    """
     cg = CoinGeckoAPI()
-    dfs = []
-    for coin in crypto_list:
-        try:
-            data = cg.get_coin_market_chart_by_id(id=coin, vs_currency=vs_currency, days=days)
-            prices = data['prices']
-            df = pd.DataFrame(prices, columns=['timestamp', coin])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            dfs.append(df)
-        except Exception as e:
-            st.error(f"Erreur lors de la récupération de {coin}: {e}")
-    if dfs:
-        df_all = pd.concat(dfs, axis=1)
-        df_all = df_all.sort_index()
-        return df_all
-    else:
+    coins = cg.get_coins_markets(vs_currency=vs_currency, order='market_cap_desc', per_page=n, page=1)
+    df = pd.DataFrame(coins)
+    # On garde uniquement l'id, le symbole et le nom
+    return df[['id', 'symbol', 'name']]
+
+@st.cache_data(ttl=3600)
+def fetch_crypto_history(coin_id, days=365, vs_currency='usd'):
+    """
+    Récupère l'historique des prix pour une crypto donnée via CoinGecko.
+    Retourne un DataFrame indexé par la date, avec une colonne "price".
+    """
+    cg = CoinGeckoAPI()
+    try:
+        data = cg.get_coin_market_chart_by_id(id=coin_id, vs_currency=vs_currency, days=days)
+        prices = data['prices']  # liste de [timestamp, price]
+        df = pd.DataFrame(prices, columns=['timestamp', 'price'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df = df.sort_index()
+        return df
+    except Exception as e:
+        st.error(f"Erreur pour {coin_id}: {e}")
         return pd.DataFrame()
 
-# --- Optimisation de portefeuille (Markowitz) ---
-def markowitz_optimization(returns, risk_free_rate=0.0):
-    mu = returns.mean().values
-    sigma = returns.cov().values
-    n = len(mu)
-    
-    w = cp.Variable(n)
-    port_return = mu @ w
-    port_vol = cp.quad_form(w, sigma) ** 0.5
-    sharpe = (port_return - risk_free_rate) / port_vol
-    
-    problem = cp.Problem(cp.Maximize(sharpe),
-                         [cp.sum(w) == 1,
-                          w >= 0])
-    problem.solve()
-    
-    optimal_weights = w.value
-    expected_sharpe = sharpe.value
-    return dict(zip(returns.columns, optimal_weights)), expected_sharpe
+def get_current_price(coin_id, vs_currency='usd'):
+    """
+    Récupère le prix actuel d'une crypto.
+    """
+    cg = CoinGeckoAPI()
+    try:
+        data = cg.get_price(ids=coin_id, vs_currencies=vs_currency)
+        return data[coin_id][vs_currency]
+    except Exception as e:
+        st.error(f"Erreur lors de la récupération du prix pour {coin_id}: {e}")
+        return None
 
-# --- Heatmap de corrélation ---
-def plot_correlation_heatmap(data):
-    corr = data.pct_change().corr()
-    fig = px.imshow(corr,
-                    text_auto=True,
-                    color_continuous_scale='RdBu_r',
-                    title="Matrice de Corrélation des Rendements")
-    return fig
+# -------------------------------
+# Fonctions de simulation & forecast
+# -------------------------------
 
-# --- Simulation "What-If" ---
-def simulate_scenarios(data, shock=-0.2, days=30):
-    last_prices = data.iloc[-1]
-    shocked_prices = last_prices * (1 + shock)
-    
-    sim_dates = pd.date_range(data.index[-1] + pd.Timedelta(days=1), periods=days)
-    sim_data = pd.DataFrame(index=sim_dates, columns=data.columns)
-    
-    for asset in data.columns:
-        sim_data[asset] = np.linspace(shocked_prices[asset], last_prices[asset], days)
-    
-    return sim_data
+def forecast_price_series(price_series, forecast_days=30, n_simulations=100):
+    """
+    Effectue une simulation Monte-Carlo pour forecast le cours futur d'une crypto.
+    On utilise ici une modélisation par mouvement Brownien géométrique.
+    Retourne un DataFrame moyen des trajectoires simulées et l'ensemble des simulations.
+    """
+    log_returns = np.log(price_series / price_series.shift(1)).dropna()
+    mu = log_returns.mean()
+    sigma = log_returns.std()
+    last_price = price_series.iloc[-1]
 
-# --- Interface Streamlit ---
-st.title("Portfolio Management Crypto")
+    dt = 1  # daily steps
+    simulations = []
+
+    for i in range(n_simulations):
+        prices = [last_price]
+        for d in range(forecast_days):
+            # Génération d'un rendement aléatoire
+            shock = np.random.normal(mu * dt, sigma * np.sqrt(dt))
+            price = prices[-1] * np.exp(shock)
+            prices.append(price)
+        simulations.append(prices)
+
+    sim_df = pd.DataFrame(simulations).T
+    forecast_mean = sim_df.mean(axis=1)
+    forecast_mean.index = [price_series.index[-1] + timedelta(days=i) for i in range(forecast_days+1)]
+    return forecast_mean, sim_df
+
+def apply_fees(portfolio_value, management_fee, performance_fee, initial_value):
+    """
+    Applique des frais de gestion et de performance sur la variation du portefeuille.
+    Pour simplifier, on déduit le management fee en proportion linéaire sur la période, et
+    le performance fee sur le gain (la partie positive).
+    """
+    # Management fee déduit linéairement sur la variation
+    mg_fee = portfolio_value * management_fee
+    gain = max(portfolio_value - initial_value, 0)
+    perf_fee = gain * performance_fee
+    net_value = portfolio_value - mg_fee - perf_fee
+    return net_value
+
+# -------------------------------
+# Fonctions de Stress Test & Risk Analysis
+# -------------------------------
+
+def stress_test(portfolio_value_series, shock_percent):
+    """
+    Simule un stress test en appliquant un choc instantané sur la valeur du portefeuille.
+    Retourne une série avec la valeur instantanée après choc.
+    """
+    shock_value = portfolio_value_series.iloc[-1] * (1 + shock_percent/100)
+    stressed = portfolio_value_series.copy()
+    stressed.iloc[-1] = shock_value
+    return stressed
+
+def risk_metrics(price_series):
+    """
+    Calcule quelques indicateurs de risque simples : volatilité (std), max drawdown.
+    """
+    returns = price_series.pct_change().dropna()
+    volatility = returns.std()
+    cum_returns = (1 + returns).cumprod()
+    peak = cum_returns.cummax()
+    drawdown = (cum_returns - peak) / peak
+    max_drawdown = drawdown.min()
+    return volatility, max_drawdown
+
+# -------------------------------
+# Interface Streamlit
+# -------------------------------
+
+st.title("Portfolio Management & Forecasting pour Cryptos")
 
 st.sidebar.header("Configuration du Portfolio")
-crypto_input = st.sidebar.text_input("Liste des cryptos (CoinGecko IDs, séparés par des virgules)", 
-                                     "bitcoin, ethereum, litecoin")
-crypto_list = [coin.strip().lower() for coin in crypto_input.split(",") if coin.strip() != ""]
-days = st.sidebar.number_input("Nombre de jours historiques", min_value=30, max_value=1095, value=365, step=1)
 
-with st.spinner("Récupération des données depuis CoinGecko ..."):
-    price_data = fetch_crypto_data(crypto_list, days=days, vs_currency='usd')
+# 1. Sélection parmi le Top 200
+top_coins_df = get_top_coins(n=200)
+coin_options = top_coins_df['name'] + " (" + top_coins_df['symbol'].str.upper() + ")"
+coin_ids = top_coins_df['id'].tolist()
+coin_dict = dict(zip(coin_options, coin_ids))
 
-if price_data.empty:
-    st.error("Aucune donnée n'a pu être récupérée. Vérifie les identifiants des cryptos.")
-    st.stop()
+selected_coins = st.sidebar.multiselect("Sélectionnez les cryptos à inclure", options=coin_options,
+                                          default=coin_options[:3])  # par défaut 3 cryptos
 
-st.header("1. Évolution des Prix Historiques")
-st.line_chart(price_data)
+selected_ids = [coin_dict[name] for name in selected_coins]
 
-st.header("2. Optimisation de Portefeuille (Markowitz)")
-returns_df = price_data.pct_change().dropna()
-optimal_weights, exp_sharpe = markowitz_optimization(returns_df)
+# 2. Montant total du portefeuille et allocation
+total_portfolio = st.sidebar.number_input("Montant total du portefeuille ($)", min_value=1000.0, value=100000.0, step=1000.0)
 
-st.write("Poids optimaux recommandés :")
-st.write(optimal_weights)
-st.write(f"Ratio de Sharpe attendu : {exp_sharpe:.2f}")
+st.sidebar.markdown("### Allocation du portefeuille")
+# Pour simplifier, on suppose une allocation égale entre les cryptos sélectionnées et le cash.
+n_assets = len(selected_ids)
+cash_allocation = st.sidebar.slider("Pourcentage d'allocation en cash", min_value=0, max_value=100, value=20, step=5)
+crypto_allocation = 100 - cash_allocation
 
-portfolio_value = price_data.copy()
-for asset in portfolio_value.columns:
-    portfolio_value[asset] = portfolio_value[asset] * optimal_weights.get(asset, 0)
-portfolio_value["Total"] = portfolio_value.sum(axis=1)
-
-st.subheader("Évolution de la Valeur du Portefeuille")
-st.line_chart(portfolio_value["Total"])
-
-st.header("3. Analyse de Corrélation et Diversification")
-fig_corr = plot_correlation_heatmap(price_data)
-st.plotly_chart(fig_corr, use_container_width=True)
-
-st.header("4. Simulations 'What-If' et Scénarios de Marché")
-shock_val = st.slider("Intensité du choc (%)", min_value=-50, max_value=0, value=-30, step=1)
-simulated_data = simulate_scenarios(price_data, shock=shock_val/100, days=30)
-st.subheader("Évolution simulée des prix (après choc)")
-st.line_chart(simulated_data)
-
-sim_portfolio_value = simulated_data.copy()
-for asset in simulated_data.columns:
-    sim_portfolio_value[asset] = simulated_data[asset] * optimal_weights.get(asset, 0)
-sim_portfolio_value["Total"] = sim_portfolio_value.sum(axis=1)
-
-st.subheader("Impact sur la Valeur du Portefeuille Optimisé")
-last_real_value = portfolio_value["Total"].iloc[-1]
-sim_final_value = sim_portfolio_value["Total"].iloc[-1]
-variation = ((sim_final_value - last_real_value) / last_real_value) * 100
-
-st.write(f"Valeur du portefeuille avant le choc : {last_real_value:.2f} $")
-st.write(f"Valeur du portefeuille après simulation : {sim_final_value:.2f} $")
-st.write(f"Variation : {variation:.2f} %")
-st.line_chart(sim_portfolio_value["Total"])
+# Répartition égale entre l
