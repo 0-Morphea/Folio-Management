@@ -55,7 +55,7 @@ def simulate_coin_forecast(last_price, annual_return, annual_vol, forecast_days=
     for t in range(1, forecast_days+1):
         shocks = np.random.normal(mu_daily * dt, sigma_daily, n_simulations)
         sims[t, :] = sims[t-1, :] * np.exp(shocks)
-    # Créer des dates pour l'index à partir d'aujourd'hui (ou à partir d'une date de référence)
+    # Générer un index de dates à partir d'aujourd'hui
     start_date = datetime.now()
     forecast_dates = [start_date + timedelta(days=i) for i in range(forecast_days+1)]
     sim_df = pd.DataFrame(sims, index=forecast_dates)
@@ -154,6 +154,11 @@ if selected_ids:
         vol = st.sidebar.number_input(f"Volatilité annuelle pour {coin_name} (%)", min_value=0.0, value=80.0, step=1.0, key=f"vol_{coin_name}")
         empirical_metrics[coin_name] = {"exp_return": exp_return, "vol": vol}
 
+# 11. Sélection de la plage de dates pour la croissance relative du portefeuille
+# Par défaut, de la date d'investissement initiale à aujourd'hui
+growth_start, growth_end = st.sidebar.date_input("Période pour la croissance relative du portefeuille", 
+                                                  value=(invest_date, datetime.now()))
+
 # -------------------------------
 # Récupération des données historiques
 # -------------------------------
@@ -195,6 +200,20 @@ for coin_name, alloc_pct in allocation_inputs.items():
         crypto_agg_hist = crypto_agg_hist.add(value_series, fill_value=0)
 
 # -------------------------------
+# Calcul de la croissance relative historique
+# -------------------------------
+# On utilise l'historique agrégé du portefeuille (crypto + cash historique)
+portfolio_hist = crypto_agg_hist.copy()
+portfolio_hist += cash_value  # On suppose que le cash reste constant pour l'historique
+# Sélection des dates pour le calcul de croissance relative
+try:
+    hist_start_value = portfolio_hist.loc[pd.Timestamp(growth_start)]
+    hist_end_value = portfolio_hist.loc[pd.Timestamp(growth_end)]
+    growth_relative = (hist_end_value / hist_start_value - 1) * 100
+except Exception as e:
+    growth_relative = None
+
+# -------------------------------
 # Création des onglets
 # -------------------------------
 tab1, tab2 = st.tabs(["Investissements Individuels", "Analyse Globale du Portefeuille"])
@@ -202,7 +221,6 @@ tab1, tab2 = st.tabs(["Investissements Individuels", "Analyse Globale du Portefe
 # ===== Onglet 1 : Investissements Individuels =====
 with tab1:
     st.markdown("### Historique & Projections par Actif")
-    # Affichage de l'historique pour chaque crypto
     fig_hist = go.Figure()
     for coin_id, df in price_data.items():
         coin_name = top_coins_df[top_coins_df['id'] == coin_id]['name'].values[0]
@@ -218,7 +236,7 @@ with tab1:
         last_price = current_prices[coin_id]
         sim_df = simulate_coin_forecast(last_price, metrics["exp_return"], metrics["vol"],
                                         forecast_days=forecast_days, n_simulations=500)
-        # Calcul des quantiles le long de l'axe des simulations (axis=1) puis transposer
+        # Calcul des quantiles (axe=1) et transposition pour avoir dates en index
         quantiles = sim_df.quantile([0.05, 0.50, 0.95], axis=1).T
         quantiles.columns = ['q05', 'q50', 'q95']
         fig_proj = go.Figure()
@@ -261,9 +279,13 @@ with tab2:
     global_return = (portfolio_current/total_portfolio - 1)*100
     st.write(f"**Rendement Global :** {global_return:.2f}%")
     
+    if growth_relative is not None:
+        st.write(f"**Croissance relative du portefeuille sur la période sélectionnée ({growth_start} à {growth_end}) :** {growth_relative:.2f}%")
+    else:
+        st.write("La période sélectionnée n'est pas disponible dans l'historique.")
+    
     st.markdown("#### Projection Globale du Portefeuille sur 12 mois (Enveloppe)")
     n_simulations = 500
-    # Pour chaque crypto, simuler la trajectoire à partir des métriques empiriques et agréger
     agg_sim = np.zeros((forecast_days+1, n_simulations))
     for coin_name, alloc_pct in allocation_inputs.items():
         coin_id = coin_dict[coin_name]
@@ -284,7 +306,7 @@ with tab2:
     last_date = crypto_agg_hist.index[-1]
     forecast_dates = [last_date + timedelta(days=i) for i in range(forecast_days+1)]
     portfolio_sim_df = pd.DataFrame(agg_sim, index=forecast_dates)
-    # IMPORTANT : Transposer le résultat de quantile pour avoir les dates en index
+    # Calculer les quantiles le long des simulations (axis=1)
     agg_quantiles = portfolio_sim_df.quantile([0.05, 0.50, 0.95], axis=1).T
     agg_quantiles.columns = ['q05', 'q50', 'q95']
     
@@ -319,19 +341,19 @@ with tab2:
     st.plotly_chart(fig_fees, use_container_width=True)
     
     st.markdown("#### Analyse de Risque Global")
-    portfolio_hist = pd.Series(dtype=float)
+    hist_portfolio = pd.Series(dtype=float)
     for coin_name, alloc_pct in allocation_inputs.items():
         coin_id = coin_dict[coin_name]
         allocation_amount = total_portfolio * (alloc_pct / 100)
         series = price_data[coin_id]['price']
         val_series = series * (allocation_amount / series.iloc[0])
-        if portfolio_hist.empty:
-            portfolio_hist = val_series
+        if hist_portfolio.empty:
+            hist_portfolio = val_series
         else:
-            portfolio_hist = portfolio_hist.add(val_series, fill_value=0)
-    portfolio_hist += cash_value
+            hist_portfolio = hist_portfolio.add(val_series, fill_value=0)
+    hist_portfolio += cash_value
 
-    vol_global, md_global = risk_metrics(portfolio_hist)
+    vol_global, md_global = risk_metrics(hist_portfolio)
     st.write(f"**Volatilité Annualisée Globale :** {vol_global:.2%}")
     st.write(f"**Max Drawdown Global :** {md_global:.2%}")
     risk_lvl = risk_label(vol_global, md_global)
@@ -339,7 +361,7 @@ with tab2:
     
     st.markdown("#### Évolution Historique du Portefeuille")
     fig_hist_global = go.Figure()
-    fig_hist_global.add_trace(go.Scatter(x=portfolio_hist.index, y=portfolio_hist, mode='lines', name='Historique Agrégé'))
+    fig_hist_global.add_trace(go.Scatter(x=hist_portfolio.index, y=hist_portfolio, mode='lines', name='Historique Agrégé'))
     fig_hist_global.update_layout(xaxis_title="Date", yaxis_title="Valeur ($)",
                                   yaxis_type="log" if log_scale else "linear")
     st.plotly_chart(fig_hist_global, use_container_width=True)
