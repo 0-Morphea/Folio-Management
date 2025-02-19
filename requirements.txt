@@ -1,9 +1,8 @@
 streamlit==1.24.0
 pandas==1.5.3
-numpy==1.23.5
+numpy>=1.24.0
 plotly==5.15.0
 cvxpy==1.5.2
 pycoingecko==1.1.0
-cvxpy==1.5.2
 ecos==2.0.14
 scs==3.2.6
