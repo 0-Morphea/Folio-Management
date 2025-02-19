@@ -43,24 +43,22 @@ def get_current_price(coin_id, vs_currency='usd'):
         return None
 
 # -------------------------------
-# Fonction de simulation & forecast pour la partie crypto
+# Fonction de simulation GBM basée sur métriques empiriques
 # -------------------------------
 
-def simulate_crypto_forecast(crypto_agg_hist, forecast_days=365, n_simulations=500):
-    # Calculer les rendements journaliers (log)
-    daily_returns = np.log(crypto_agg_hist / crypto_agg_hist.shift(1)).dropna()
-    mu_crypto = daily_returns.mean()
-    sigma_crypto = daily_returns.std()
-    last_value = crypto_agg_hist.iloc[-1]
-    
-    # Simulation GBM
+def simulate_coin_forecast(last_price, annual_return, annual_vol, forecast_days=365, n_simulations=500):
+    # Convertir rendement et volatilité annuels en paramètres quotidiens
+    dt = 1/365
+    mu_daily = annual_return/100 - 0.5 * (annual_vol/100)**2
+    sigma_daily = (annual_vol/100) * np.sqrt(dt)
     sims = np.zeros((forecast_days+1, n_simulations))
-    sims[0, :] = last_value
+    sims[0, :] = last_price
     for t in range(1, forecast_days+1):
-        shocks = np.random.normal(mu_crypto, sigma_crypto, n_simulations)
+        shocks = np.random.normal(mu_daily*dt, sigma_daily, n_simulations)
         sims[t, :] = sims[t-1, :] * np.exp(shocks)
-    sim_df = pd.DataFrame(sims, 
-                          index=[crypto_agg_hist.index[-1] + timedelta(days=i) for i in range(forecast_days+1)])
+    sim_df = pd.DataFrame(sims, index=[last_price] + [None]*(forecast_days))
+    # Remplacer l'index par des dates à partir de la dernière date connue
+    # Ici, nous utiliserons une date fictive, à adapter selon vos besoins
     return sim_df
 
 # -------------------------------
@@ -118,7 +116,6 @@ total_portfolio = st.sidebar.number_input("Montant total du portefeuille ($)", m
 # 3. Allocation entre cash et cryptos
 cash_allocation = st.sidebar.slider("Pourcentage d'allocation en cash", min_value=0, max_value=100, value=20, step=5)
 crypto_allocation_pct = 100 - cash_allocation
-
 st.sidebar.markdown(f"Allocation globale en cryptos : **{crypto_allocation_pct}%**")
 
 # 4. Pour chaque crypto, définir l'allocation en %
@@ -128,7 +125,7 @@ if selected_ids:
     total_alloc = 0
     for coin_name in selected_coins:
         alloc = st.sidebar.number_input(f"Allocation pour {coin_name} (%)", min_value=0.0, max_value=100.0, 
-                                          value=round(crypto_allocation_pct/len(selected_coins),1), step=0.5, key=coin_name)
+                                          value=round(crypto_allocation_pct/len(selected_coins),1), step=0.5, key=f"alloc_{coin_name}")
         allocation_inputs[coin_name] = alloc
         total_alloc += alloc
     if total_alloc != 0:
@@ -149,11 +146,20 @@ forecast_days = st.sidebar.number_input("Période de forecast (jours)", min_valu
 # 8. Stress Test
 stress_shock = st.sidebar.number_input("Choc de stress (variation en %)", min_value=-100, max_value=0, value=-30, step=5)
 
-# Date d'investissement initiale (pour comparaison)
+# 9. Date d'investissement initiale
 invest_date = st.sidebar.date_input("Date d'investissement initiale", value=datetime.now()-timedelta(days=365))
 
+# 10. Pour chaque crypto, définir les métriques empiriques (rendement annuel attendu et volatilité)
+empirical_metrics = {}
+if selected_ids:
+    st.sidebar.markdown("### Métriques Empiriques par Crypto")
+    for coin_name in selected_coins:
+        exp_return = st.sidebar.number_input(f"Rendement annuel attendu pour {coin_name} (%)", min_value=-100.0, value=50.0, step=1.0, key=f"exp_return_{coin_name}")
+        vol = st.sidebar.number_input(f"Volatilité annuelle pour {coin_name} (%)", min_value=0.0, value=80.0, step=1.0, key=f"vol_{coin_name}")
+        empirical_metrics[coin_name] = {"exp_return": exp_return, "vol": vol}
+
 # -------------------------------
-# Récupération des données
+# Récupération des données historiques
 # -------------------------------
 
 price_data = {}
@@ -186,7 +192,7 @@ for coin_name, alloc_pct in allocation_inputs.items():
     coin_id = coin_dict[coin_name]
     allocation_amount = total_portfolio * (alloc_pct / 100)
     series = price_data[coin_id]['price']
-    # Valeur de l'investissement dans la crypto, supposé acheté au début de la période
+    # Valeur de l'investissement dans la crypto (acheté au début de la période)
     value_series = series * (allocation_amount / series.iloc[0])
     if crypto_agg_hist is None:
         crypto_agg_hist = value_series
@@ -202,7 +208,6 @@ tab1, tab2 = st.tabs(["Investissements Individuels", "Analyse Globale du Portefe
 # ===== Onglet 1 : Investissements Individuels =====
 with tab1:
     st.markdown("### Historique & Projections par Actif")
-    # Affichage de l'historique pour chaque crypto
     fig_hist = go.Figure()
     for coin_id, df in price_data.items():
         coin_name = top_coins_df[top_coins_df['id'] == coin_id]['name'].values[0]
@@ -211,12 +216,17 @@ with tab1:
         fig_hist.update_layout(yaxis_type="log")
     st.plotly_chart(fig_hist, use_container_width=True)
     
-    # Projection pour chaque crypto
     st.markdown("#### Projections Individuelles (12 mois)")
     for coin_id in selected_ids:
         coin_name = top_coins_df[top_coins_df['id'] == coin_id]['name'].values[0]
-        series = price_data[coin_id]['price']
-        sim_df, quantiles = forecast_price_series(series, forecast_days=forecast_days, n_simulations=500)
+        # Utiliser les métriques empiriques fournies par l'utilisateur
+        metrics = empirical_metrics.get(coin_name, {"exp_return": 50.0, "vol": 80.0})
+        last_price = current_prices[coin_id]
+        sim_df = simulate_coin_forecast(last_price, metrics["exp_return"], metrics["vol"],
+                                        forecast_days=forecast_days, n_simulations=500)
+        # Calcul des quantiles
+        quantiles = sim_df.quantile([0.05, 0.50, 0.95], axis=1).T
+        quantiles.columns = ['q05', 'q50', 'q95']
         fig_proj = go.Figure()
         fig_proj.add_trace(go.Scatter(x=quantiles.index, y=quantiles['q05'], mode='lines',
                                       line=dict(color='red', dash='dash'), name='5e percentile'))
@@ -229,9 +239,7 @@ with tab1:
                                yaxis_type="log" if log_scale else "linear")
         st.plotly_chart(fig_proj, use_container_width=True)
     
-    # Analyses complémentaires individuelles
     st.markdown("#### Analyses Complémentaires")
-    # Scatter Plot Risque/Retour
     risk_return_data = []
     for coin_id, df in price_data.items():
         coin_name = top_coins_df[top_coins_df['id'] == coin_id]['name'].values[0]
@@ -243,7 +251,6 @@ with tab1:
                              title="Scatter Plot Risque/Retour", labels={"Volatility": "Volatilité Annualisée", "Annual Return": "Retour Annualisé"})
     st.plotly_chart(fig_scatter, use_container_width=True)
     
-    # Heatmap de Corrélation
     price_df = pd.DataFrame()
     for coin_id, df in price_data.items():
         coin_name = top_coins_df[top_coins_df['id'] == coin_id]['name'].values[0]
@@ -260,31 +267,31 @@ with tab2:
     global_return = (portfolio_current/total_portfolio - 1)*100
     st.write(f"**Rendement Global :** {global_return:.2f}%")
     
-    # --- Forecast Global avec Enveloppe via simulation GBM sur la partie crypto ---
     st.markdown("#### Projection Globale du Portefeuille sur 12 mois (Enveloppe)")
-    
     n_simulations = 500
-    # Simulation pour la partie crypto via GBM
-    simulated_crypto_df = simulate_crypto_forecast(crypto_agg_hist, forecast_days=forecast_days, n_simulations=n_simulations)
-    
-    # Simulation du cash (déterministe, avec croissance exponentielle)
+    # Pour chaque crypto, simuler la trajectoire à partir des métriques empiriques
+    agg_sim = np.zeros((forecast_days+1, n_simulations))
+    for coin_name, alloc_pct in allocation_inputs.items():
+        coin_id = coin_dict[coin_name]
+        metrics = empirical_metrics.get(coin_name, {"exp_return": 50.0, "vol": 80.0})
+        last_price = current_prices[coin_id]
+        sim_df = simulate_coin_forecast(last_price, metrics["exp_return"], metrics["vol"],
+                                        forecast_days=forecast_days, n_simulations=n_simulations)
+        allocation_amount = total_portfolio * (alloc_pct / 100)
+        num_coins = allocation_amount / last_price
+        agg_sim += sim_df.values * num_coins
+
+    # Simulation du cash (croissance exponentielle)
     days_array = np.arange(forecast_days+1)
-    cash_forecast = cash_value * np.exp((yield_cash/100) * (days_array/365))
+    cash_sim = cash_value * np.exp((yield_cash/100) * (days_array/365))
+    agg_sim += cash_sim[:, np.newaxis]
     
-    # Agréger la partie crypto simulée et le cash
-    # Pour chaque simulation, ajouter le cash forecast (broadcasting)
-    portfolio_sim = simulated_crypto_df.values + cash_forecast[:, np.newaxis]
-    
-    # Conversion en DataFrame avec dates forecast
     last_date = crypto_agg_hist.index[-1]
     forecast_dates = [last_date + timedelta(days=i) for i in range(forecast_days+1)]
-    portfolio_sim_df = pd.DataFrame(portfolio_sim, index=forecast_dates)
-    
-    # Calcul des quantiles (enveloppe) le long des simulations (axis=1)
+    portfolio_sim_df = pd.DataFrame(agg_sim, index=forecast_dates)
     agg_quantiles = portfolio_sim_df.quantile([0.05, 0.50, 0.95], axis=1)
     agg_quantiles.columns = ['q05', 'q50', 'q95']
     
-    # Graphique de l'enveloppe forecast
     fig_envelope = go.Figure()
     fig_envelope.add_trace(go.Scatter(x=agg_quantiles.index, y=agg_quantiles['q05'], mode='lines',
                                       line=dict(color='red', dash='dash'), name='5e percentile'))
@@ -297,12 +304,9 @@ with tab2:
                                yaxis_type="log" if log_scale else "linear")
     st.plotly_chart(fig_envelope, use_container_width=True)
     
-    # --- Visualisation des Fees Prévisionnels ---
     st.markdown("#### Projection des Fees Prévisionnels sur 12 mois")
-    # Pour la gestion, le fee quotidien = (management_fee/365) * valeur forecastée médiane
     daily_mgmt_fee = agg_quantiles['q50'] * (management_fee / 365)
     cumulative_mgmt_fee = np.cumsum(daily_mgmt_fee)
-    # Pour la performance, fee appliqué sur le gain par rapport à la valeur actuelle (si positif), réparti linéairement
     daily_perf_fee = np.maximum(agg_quantiles['q50'] - portfolio_current, 0) * (performance_fee / forecast_days)
     cumulative_perf_fee = np.cumsum(daily_perf_fee)
     cumulative_total_fee = cumulative_mgmt_fee + cumulative_perf_fee
@@ -318,7 +322,7 @@ with tab2:
                            xaxis_title="Date", yaxis_title="Fees en $")
     st.plotly_chart(fig_fees, use_container_width=True)
     
-    # --- Analyse de Risque Global ---
+    st.markdown("#### Analyse de Risque Global")
     portfolio_hist = pd.Series(dtype=float)
     for coin_name, alloc_pct in allocation_inputs.items():
         coin_id = coin_dict[coin_name]
