@@ -243,51 +243,74 @@ with tab1:
 # ===== Onglet 2 : Analyse Globale du Portefeuille =====
 with tab2:
     st.markdown("### Analyse Globale du Portefeuille")
-    # Valeurs de base
     st.write(f"**Investissement Initial (au {invest_date.strftime('%Y-%m-%d')}) :** ${total_portfolio:,.2f}")
     st.write(f"**Valeur Actuelle du Portefeuille :** ${portfolio_current:,.2f}")
     global_return = (portfolio_current/total_portfolio - 1)*100
     st.write(f"**Rendement Global :** {global_return:.2f}%")
     
-    # Projection globale du portefeuille (forecast global)
-    st.markdown("#### Projection Globale du Portefeuille sur 12 mois")
-    forecast_agg = pd.Series(index=[list(price_data.values())[0].index[-1] + timedelta(days=i) for i in range(forecast_days+1)], dtype=float)
-    forecast_agg[:] = 0.0
+    # --- Forecast Global avec Enveloppe ---
+    st.markdown("#### Projection Globale du Portefeuille sur 12 mois (Enveloppe)")
+    n_simulations = 500
+    # Initialiser un tableau pour les simulations agrégées
+    agg_sim = np.zeros((n_simulations, forecast_days+1))
+    # Pour chaque crypto, ajouter sa simulation pondérée
     for coin_name, alloc_pct in allocation_inputs.items():
         coin_id = coin_dict[coin_name]
         series = price_data[coin_id]['price']
-        _, quantiles = forecast_price_series(series, forecast_days=forecast_days, n_simulations=500)
+        sim_df, _ = forecast_price_series(series, forecast_days=forecast_days, n_simulations=n_simulations)
         allocation_amount = total_portfolio * (alloc_pct / 100)
-        forecast_agg += quantiles['q50'] * (allocation_amount / current_prices[coin_id])
-    cash_forecast = cash_value * (1 + (yield_cash/100) * (np.arange(forecast_days+1)/365))
-    global_forecast = forecast_agg + pd.Series(cash_forecast, index=forecast_agg.index)
-    
-    fig_global = go.Figure()
-    fig_global.add_trace(go.Scatter(x=global_forecast.index, y=global_forecast, mode='lines', name='Forecast Global (Médiane)'))
-    fig_global.update_layout(title="Projection de la Valeur du Portefeuille sur 12 mois",
-                             xaxis_title="Date", yaxis_title="Valeur du Portefeuille ($)",
-                             yaxis_type="log" if log_scale else "linear")
-    st.plotly_chart(fig_global, use_container_width=True)
-    
-    # Calcul et visualisation des Fees prévisionnels
-    # Pour la gestion, on cumule un fee quotidien égal à (management_fee/365)*valeur du portefeuille forecastée
-    # Pour la performance, on cumule un fee proportionnel au gain par rapport à la valeur actuelle, réparti linéairement
+        # Nombre de coins acquis au prix actuel
+        num_coins = allocation_amount / current_prices[coin_id]
+        # Ajouter la valeur forecastée pour cette crypto
+        agg_sim += sim_df.values * num_coins
+    # Simulation du cash (déterministe)
     days_array = np.arange(forecast_days+1)
-    daily_mgmt_fee = global_forecast * (management_fee / 365)
+    cash_sim = cash_value * (1 + (yield_cash/100) * (days_array/365))
+    # Ajouter le cash (même pour toutes les simulations)
+    agg_sim += np.tile(cash_sim, (n_simulations, 1))
+    
+    # Conversion en DataFrame
+    forecast_dates = [list(price_data.values())[0].index[-1] + timedelta(days=i) for i in range(forecast_days+1)]
+    agg_sim_df = pd.DataFrame(agg_sim.T, index=forecast_dates)
+    # Calcul des quantiles pour l'enveloppe
+    agg_quantiles = agg_sim_df.quantile([0.05, 0.50, 0.95]).T
+    agg_quantiles.columns = ['q05', 'q50', 'q95']
+    
+    # Graphique de l'enveloppe
+    fig_envelope = go.Figure()
+    fig_envelope.add_trace(go.Scatter(x=agg_quantiles.index, y=agg_quantiles['q05'], mode='lines',
+                                      line=dict(color='red', dash='dash'), name='5e percentile'))
+    fig_envelope.add_trace(go.Scatter(x=agg_quantiles.index, y=agg_quantiles['q95'], mode='lines',
+                                      line=dict(color='green', dash='dash'), name='95e percentile', fill='tonexty'))
+    fig_envelope.add_trace(go.Scatter(x=agg_quantiles.index, y=agg_quantiles['q50'], mode='lines',
+                                      line=dict(color='blue'), name='Médiane'))
+    fig_envelope.update_layout(title="Projection Globale du Portefeuille (Enveloppe Forecast)",
+                               xaxis_title="Date", yaxis_title="Valeur du Portefeuille ($)",
+                               yaxis_type="log" if log_scale else "linear")
+    st.plotly_chart(fig_envelope, use_container_width=True)
+    
+    # --- Visualisation des Fees prévisionnels ---
+    st.markdown("#### Projection des Fees Prévisionnels sur 12 mois")
+    # Pour le management fee : fee quotidien = (management_fee/365) * valeur forecastée
+    daily_mgmt_fee = agg_quantiles['q50'] * (management_fee / 365)
     cumulative_mgmt_fee = np.cumsum(daily_mgmt_fee)
-    daily_perf_fee = np.maximum(global_forecast - portfolio_current, 0) * (performance_fee / forecast_days)
+    # Pour le performance fee : appliqué sur le gain par rapport à la valeur actuelle (si positif)
+    daily_perf_fee = np.maximum(agg_quantiles['q50'] - portfolio_current, 0) * (performance_fee / forecast_days)
     cumulative_perf_fee = np.cumsum(daily_perf_fee)
     cumulative_total_fee = cumulative_mgmt_fee + cumulative_perf_fee
-
+    
     fig_fees = go.Figure()
-    fig_fees.add_trace(go.Scatter(x=global_forecast.index, y=cumulative_mgmt_fee, mode='lines', name='Cumulative Management Fee'))
-    fig_fees.add_trace(go.Scatter(x=global_forecast.index, y=cumulative_perf_fee, mode='lines', name='Cumulative Performance Fee'))
-    fig_fees.add_trace(go.Scatter(x=global_forecast.index, y=cumulative_total_fee, mode='lines', name='Cumulative Total Fee'))
-    fig_fees.update_layout(title="Projection des Fees Cumulés sur 12 mois",
+    fig_fees.add_trace(go.Scatter(x=agg_quantiles.index, y=cumulative_mgmt_fee, mode='lines',
+                                  name='Cumulative Management Fee'))
+    fig_fees.add_trace(go.Scatter(x=agg_quantiles.index, y=cumulative_perf_fee, mode='lines',
+                                  name='Cumulative Performance Fee'))
+    fig_fees.add_trace(go.Scatter(x=agg_quantiles.index, y=cumulative_total_fee, mode='lines',
+                                  name='Cumulative Total Fee'))
+    fig_fees.update_layout(title="Projection Cumulative des Fees sur 12 mois",
                            xaxis_title="Date", yaxis_title="Fees en $")
     st.plotly_chart(fig_fees, use_container_width=True)
     
-    # Analyse de risque global
+    # --- Analyse de Risque Global ---
     portfolio_hist = pd.Series(dtype=float)
     for coin_name, alloc_pct in allocation_inputs.items():
         coin_id = coin_dict[coin_name]
@@ -303,7 +326,6 @@ with tab2:
     vol_global, md_global = risk_metrics(portfolio_hist)
     st.write(f"**Volatilité Annualisée Globale :** {vol_global:.2%}")
     st.write(f"**Max Drawdown Global :** {md_global:.2%}")
-    
     risk_lvl = risk_label(vol_global, md_global)
     st.write(f"**Niveau de Risque Global :** {risk_lvl}")
     
