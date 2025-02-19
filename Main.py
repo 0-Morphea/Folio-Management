@@ -5,81 +5,47 @@ import plotly.express as px
 import plotly.graph_objects as go
 import cvxpy as cp
 from datetime import datetime, timedelta
+from pycoingecko import CoinGeckoAPI
 
-# ------------------------------
-# Fonctions d'import / génération de données
-# ------------------------------
+# --- 1. Récupération des données de prix via CoinGecko ---
 
-@st.cache_data
-def load_excel_data(uploaded_file):
+@st.cache_data(ttl=3600)
+def fetch_crypto_data(crypto_list, days=365, vs_currency='usd'):
     """
-    Charge un fichier Excel et retourne un DataFrame avec l'index en datetime.
-    Le fichier doit contenir une colonne de dates (ou être indexé par dates)
-    et une colonne par crypto.
+    Récupère les données historiques de prix pour chaque crypto de la liste.
+    Retourne un DataFrame indexé par la date, avec une colonne par crypto.
     """
-    df = pd.read_excel(uploaded_file, engine='openpyxl')
-    if 'Date' in df.columns:
-        df['Date'] = pd.to_datetime(df['Date'])
-        df.set_index('Date', inplace=True)
-    else:
+    cg = CoinGeckoAPI()
+    dfs = []
+    for coin in crypto_list:
         try:
-            df.index = pd.to_datetime(df.index)
+            data = cg.get_coin_market_chart_by_id(id=coin, vs_currency=vs_currency, days=days)
+            prices = data['prices']  # liste de [timestamp, prix]
+            df = pd.DataFrame(prices, columns=['timestamp', coin])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            dfs.append(df)
         except Exception as e:
-            st.error("L'index n'est pas au format date.")
-    df.sort_index(inplace=True)
-    return df
+            st.error(f"Erreur lors de la récupération de {coin}: {e}")
+    if dfs:
+        df_all = pd.concat(dfs, axis=1)
+        df_all = df_all.sort_index()
+        return df_all
+    else:
+        return pd.DataFrame()
 
-def generate_crypto_data(start_date, end_date, assets):
-    """
-    Génère des données simulées (random walk) pour une liste d'actifs.
-    """
-    dates = pd.date_range(start_date, end_date)
-    data = pd.DataFrame(index=dates)
-    np.random.seed(42)
-    for asset in assets:
-        # Simulation d'un random walk avec drift
-        price = 100 + np.cumsum(np.random.normal(loc=0.1, scale=2, size=len(dates)))
-        data[asset] = price
-    return data
-
-# ------------------------------
-# Fonctionnalité 1 : Backtesting SMA Crossover
-# ------------------------------
-
-def backtest_sma(data, short_window=10, long_window=30):
-    """Backtest simple d'une stratégie SMA crossover pour chaque crypto."""
-    signals = {}
-    returns = {}
-    
-    for asset in data.columns:
-        df = pd.DataFrame()
-        df["price"] = data[asset]
-        df["SMA_short"] = df["price"].rolling(window=short_window).mean()
-        df["SMA_long"] = df["price"].rolling(window=long_window).mean()
-        df.dropna(inplace=True)
-        df["signal"] = np.where(df["SMA_short"] > df["SMA_long"], 1, 0)
-        df["position"] = df["signal"].shift(1).fillna(0)
-        df["ret"] = df["price"].pct_change()
-        df["strategy_ret"] = df["position"] * df["ret"]
-        df["cum_strategy"] = (1 + df["strategy_ret"]).cumprod()
-        signals[asset] = df
-        returns[asset] = df["strategy_ret"]
-        
-    return signals, returns
-
-# ------------------------------
-# Fonctionnalité 2 : Optimisation de Portefeuille (Markowitz)
-# ------------------------------
+# --- 2. Optimisation de portefeuille (Markowitz) ---
 
 def markowitz_optimization(returns, risk_free_rate=0.0):
     """
-    Optimise la répartition du portefeuille en maximisant le ratio de Sharpe.
+    Calcule l’optimisation du portefeuille en maximisant le ratio de Sharpe.
+    Contraintes : somme des poids = 1 et poids >= 0 (pas de short-selling).
     """
     mu = returns.mean().values
     sigma = returns.cov().values
     n = len(mu)
     
-    # Variables d'optimisation
+    # Définition de la variable d'optimisation (poids)
     w = cp.Variable(n)
     port_return = mu @ w
     port_vol = cp.quad_form(w, sigma) ** 0.5
@@ -94,9 +60,7 @@ def markowitz_optimization(returns, risk_free_rate=0.0):
     expected_sharpe = sharpe.value
     return dict(zip(returns.columns, optimal_weights)), expected_sharpe
 
-# ------------------------------
-# Fonctionnalité 3 : Visualisation et Analyse de Corrélation
-# ------------------------------
+# --- 3. Heatmap de corrélation ---
 
 def plot_correlation_heatmap(data):
     corr = data.pct_change().corr()
@@ -106,13 +70,13 @@ def plot_correlation_heatmap(data):
                     title="Matrice de Corrélation des Rendements")
     return fig
 
-# ------------------------------
-# Fonctionnalité 4 : Simulation "What-If" et Scénarios de Marché
-# ------------------------------
+# --- 4. Simulation "What-If" ---
 
 def simulate_scenarios(data, shock=-0.2, days=30):
     """
-    Simule un scénario de marché en appliquant un choc aux prix et une reprise linéaire.
+    Simule un scénario de marché : application d’un choc (en pourcentage)
+    sur les prix du dernier jour, suivi d’une reprise linéaire sur 'days' jours.
+    Retourne un DataFrame simulé pour chaque crypto.
     """
     last_prices = data.iloc[-1]
     shocked_prices = last_prices * (1 + shock)
@@ -125,102 +89,80 @@ def simulate_scenarios(data, shock=-0.2, days=30):
     
     return sim_data
 
-# ------------------------------
-# Interface Streamlit
-# ------------------------------
+# --- Interface Streamlit ---
 
 st.title("Portfolio Management Crypto")
 
+# --- 1. Gestion dynamique du portfolio et récupération des données ---
+
 st.sidebar.header("Configuration du Portfolio")
 
-# Choix de la source des données
-data_source = st.sidebar.radio("Source des données historiques", ("Données simulées", "Fichier Excel"))
+# Saisie de la liste des cryptos (les identifiants CoinGecko en minuscules)
+crypto_input = st.sidebar.text_input("Liste des cryptos (CoinGecko IDs, séparés par des virgules)", 
+                                     "bitcoin, ethereum, litecoin")
+crypto_list = [coin.strip().lower() for coin in crypto_input.split(",") if coin.strip() != ""]
 
-if data_source == "Fichier Excel":
-    uploaded_file = st.sidebar.file_uploader("Importer un fichier Excel", type=["xlsx"])
-    if uploaded_file is not None:
-        try:
-            data = load_excel_data(uploaded_file)
-            st.success("Fichier importé avec succès.")
-        except Exception as e:
-            st.error(f"Erreur lors de l'importation du fichier: {e}")
-            st.stop()
-    else:
-        st.info("Veuillez importer un fichier Excel pour continuer.")
-        st.stop()
-else:
-    # Saisie des cryptos souhaitées
-    asset_input = st.sidebar.text_input("Liste des cryptos (séparées par des virgules)", "Bitcoin,Ethereum,Litecoin")
-    assets = [asset.strip() for asset in asset_input.split(",") if asset.strip() != ""]
-    # Période de simulation
-    start_date = st.sidebar.date_input("Date de début", datetime.now() - timedelta(days=365))
-    end_date = st.sidebar.date_input("Date de fin", datetime.now())
-    if start_date >= end_date:
-        st.error("La date de début doit être antérieure à la date de fin.")
-        st.stop()
-    data = generate_crypto_data(start_date, end_date, assets)
+# Choix du nombre de jours historiques à récupérer
+days = st.sidebar.number_input("Nombre de jours historiques", min_value=30, max_value=1095, value=365, step=1)
 
-st.header("1. Visualisation des Données Historiques")
-st.line_chart(data)
+# Récupération des données de prix
+with st.spinner("Récupération des données depuis CoinGecko ..."):
+    price_data = fetch_crypto_data(crypto_list, days=days, vs_currency='usd')
 
-# ------------------------------
-# Backtesting SMA Crossover
-# ------------------------------
+if price_data.empty:
+    st.error("Aucune donnée n'a pu être récupérée. Vérifie les identifiants des cryptos.")
+    st.stop()
 
-st.header("2. Backtesting de la Stratégie SMA Crossover")
-selected_asset = st.selectbox("Sélectionnez un actif pour le backtest", data.columns)
-signals_dict, returns_dict = backtest_sma(data)
-df_signal = signals_dict[selected_asset].reset_index()
+st.header("1. Évolution des Prix Historiques")
+st.line_chart(price_data)
 
-fig_bt = go.Figure()
-fig_bt.add_trace(go.Scatter(x=df_signal["index"], y=df_signal["price"], mode='lines', name='Prix'))
-fig_bt.add_trace(go.Scatter(x=df_signal["index"], y=df_signal["SMA_short"], mode='lines', name='SMA Short'))
-fig_bt.add_trace(go.Scatter(x=df_signal["index"], y=df_signal["SMA_long"], mode='lines', name='SMA Long'))
-st.plotly_chart(fig_bt, use_container_width=True)
+# Calcul du rendement du portefeuille si on applique les poids optimaux
+# --- 2. Optimisation de Portefeuille (Markowitz) ---
 
-st.subheader("Performance de la stratégie")
-st.line_chart(df_signal.set_index("index")["cum_strategy"])
-
-# ------------------------------
-# Optimisation de Portefeuille (Markowitz)
-# ------------------------------
-
-st.header("3. Optimisation de Portefeuille (Markowitz)")
-# Pour l'optimisation, on utilise les rendements quotidiens sur toutes les cryptos
-returns_df = data.pct_change().dropna()
+st.header("2. Optimisation de Portefeuille (Markowitz)")
+returns_df = price_data.pct_change().dropna()
 optimal_weights, exp_sharpe = markowitz_optimization(returns_df)
 
 st.write("Poids optimaux recommandés :")
 st.write(optimal_weights)
 st.write(f"Ratio de Sharpe attendu : {exp_sharpe:.2f}")
 
-# ------------------------------
-# Analyse de Corrélation
-# ------------------------------
+# Calcul de la valeur du portefeuille sur l'historique
+# On suppose une valeur initiale (par exemple 1.0) multipliée par les poids
+portfolio_value = price_data.copy()
+for asset in portfolio_value.columns:
+    portfolio_value[asset] = portfolio_value[asset] * optimal_weights.get(asset, 0)
+portfolio_value["Total"] = portfolio_value.sum(axis=1)
 
-st.header("4. Analyse de Corrélation et Diversification")
-fig_corr = plot_correlation_heatmap(data)
+st.subheader("Évolution de la Valeur du Portefeuille")
+st.line_chart(portfolio_value["Total"])
+
+# --- 3. Analyse de Corrélation et Diversification ---
+
+st.header("3. Analyse de Corrélation et Diversification")
+fig_corr = plot_correlation_heatmap(price_data)
 st.plotly_chart(fig_corr, use_container_width=True)
 
-# ------------------------------
-# Simulation "What-If" et Scénarios de Marché
-# ------------------------------
+# --- 4. Simulation "What-If" et Scénarios de Marché ---
 
-st.header("5. Simulations 'What-If' et Scénarios de Marché")
+st.header("4. Simulations 'What-If' et Scénarios de Marché")
 shock_val = st.slider("Intensité du choc (%)", min_value=-50, max_value=0, value=-30, step=1)
-simulated_data = simulate_scenarios(data, shock=shock_val/100, days=30)
+simulated_data = simulate_scenarios(price_data, shock=shock_val/100, days=30)
+st.subheader("Évolution simulée des prix (après choc)")
 st.line_chart(simulated_data)
 
-st.subheader("Impact sur le Portefeuille Optimisé")
-# Valorisation du portefeuille optimisé avant le choc
-last_prices = data.iloc[-1]
-portfolio_value_before = sum(last_prices[asset] * optimal_weights.get(asset, 0) for asset in data.columns)
-# Valorisation après le choc (dernier jour de la simulation)
-sim_last_prices = simulated_data.iloc[-1]
-portfolio_value_after = sum(sim_last_prices[asset] * optimal_weights.get(asset, 0) for asset in data.columns)
-variation = ((portfolio_value_after - portfolio_value_before)/portfolio_value_before)*100
+# Impact sur la valeur du portefeuille optimisé
+sim_portfolio_value = simulated_data.copy()
+for asset in simulated_data.columns:
+    sim_portfolio_value[asset] = simulated_data[asset] * optimal_weights.get(asset, 0)
+sim_portfolio_value["Total"] = sim_portfolio_value.sum(axis=1)
 
-st.write(f"Valeur du portefeuille avant le choc : {portfolio_value_before:.2f}")
-st.write(f"Valeur du portefeuille après simulation : {portfolio_value_after:.2f}")
-st.write(f"Variation : {variation:.2f}%")
+st.subheader("Impact sur la Valeur du Portefeuille Optimisé")
+last_real_value = portfolio_value["Total"].iloc[-1]
+sim_final_value = sim_portfolio_value["Total"].iloc[-1]
+variation = ((sim_final_value - last_real_value) / last_real_value) * 100
 
+st.write(f"Valeur du portefeuille avant le choc : {last_real_value:.2f} $")
+st.write(f"Valeur du portefeuille après simulation : {sim_final_value:.2f} $")
+st.write(f"Variation : {variation:.2f} %")
+st.line_chart(sim_portfolio_value["Total"])
